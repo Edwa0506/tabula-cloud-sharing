@@ -9,9 +9,9 @@ Cloudflare automatically provisions the resources in `wrangler.jsonc` during but
 For local development:
 
 ```sh
-pnpm install
-pnpm check
-pnpm dev
+npm install
+npm run check
+npm run dev
 ```
 
 ## License
