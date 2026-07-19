@@ -50,8 +50,6 @@ const MAX_MESSAGES_PER_WINDOW = 500;
 const MAX_BYTES_PER_WINDOW = 48 * 1024 * 1024;
 const RECOVERY_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 const STORAGE_CHUNK_CHARS = 1_000_000;
-const MAX_ROOM_STORAGE_BYTES = 256 * 1024 * 1024;
-const MAX_ROOM_RECORDS = 10_000;
 
 const corsHeaders = {
   "access-control-allow-origin": "*",
@@ -271,9 +269,9 @@ export class CollaborationRoom extends DurableObject<Env> {
       const stored = await persist;
       this.broadcast(stored);
     } catch (error) {
-      const quota = error instanceof StorageQuotaError;
+      const quota = isStorageLimitError(error);
       const message = quota
-        ? error.message
+        ? "Cloudflare’s Workers Free storage allowance is full. Delete an older shared project or its cloud copy, then try again."
         : "The encrypted cloud copy could not be saved.";
       this.send(socket, { type: "error", message });
       socket.close(quota ? 4429 : 1011, message);
@@ -378,15 +376,8 @@ export class CollaborationRoom extends DurableObject<Env> {
       const serialized = JSON.stringify(stored);
       const byteLength = new TextEncoder().encode(serialized).byteLength;
       const baseSequence = Number.isSafeInteger(envelope.baseSequence) ? envelope.baseSequence! : -1;
-      const current = this.roomStorageStats();
       const useAsSnapshot = envelope.persistence === "snapshot"
         && baseSequence >= metadata.snapshotBaseSequence;
-      const replaced = useAsSnapshot ? this.snapshotAndUpdateStats(baseSequence) : { storedBytes: 0, storedObjects: 0 };
-      const projectedBytes = current.storedBytes - replaced.storedBytes + byteLength;
-      const projectedObjects = current.storedObjects - replaced.storedObjects + 1;
-      if (projectedBytes > MAX_ROOM_STORAGE_BYTES || projectedObjects > MAX_ROOM_RECORDS) {
-        throw new StorageQuotaError("This project reached Tabula’s free cloud-storage limit. Stop sharing an older project or delete its cloud copy, then try again.");
-      }
 
       if (useAsSnapshot) {
         this.ctx.storage.sql.exec("DELETE FROM encrypted_envelopes WHERE kind = 'snapshot'");
@@ -463,16 +454,6 @@ export class CollaborationRoom extends DurableObject<Env> {
     );
   }
 
-  private snapshotAndUpdateStats(sequence: number) {
-    return this.storageStats(
-      `SELECT COALESCE(SUM(byte_length), 0) AS storedBytes,
-              COALESCE(SUM(CASE WHEN chunk_index = 0 THEN 1 ELSE 0 END), 0) AS storedObjects
-       FROM encrypted_envelopes
-       WHERE kind = 'snapshot' OR (kind = 'update' AND sequence <= ?)`,
-      sequence,
-    );
-  }
-
   private async purgeRoom() {
     if (!this.roomId) {
       const metadata = this.ctx.storage.kv.get<RoomMetadata>("metadata");
@@ -524,7 +505,14 @@ export class CollaborationRoom extends DurableObject<Env> {
   }
 }
 
-class StorageQuotaError extends Error {}
+function isStorageLimitError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  return normalized.includes("sqlite_full")
+    || normalized.includes("database or disk is full")
+    || normalized.includes("storage limit")
+    || normalized.includes("storage quota");
+}
 
 function isEncryptedEnvelope(
   value: Record<string, unknown>,
