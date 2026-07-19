@@ -4,7 +4,7 @@ This standalone Cloudflare Worker provides Tabula's encrypted persistent collabo
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Edwa0506/tabula-cloud-sharing)
 
-Cloudflare automatically provisions the free-plan-compatible Durable Object in `wrangler.jsonc` during button deployment. No R2 subscription or payment method is required. Each shared project is capped at 256 MiB and 10,000 stored records; Cloudflare's Workers Free limits fail closed instead of creating usage charges. After deployment, copy the Worker's `https://…workers.dev` address into Tabula's **Shared Projects** screen.
+Cloudflare automatically provisions the free-plan-compatible Durable Object in `wrangler.jsonc` during button deployment. No R2 subscription or payment method is required. Tabula relies on Cloudflare's Workers Free hard limits instead of imposing a smaller application quota. Cloudflare currently allows up to 1 GB in one Free-plan Durable Object and 5 GB total across the account; writes fail rather than creating usage charges when a limit is reached. After deployment, copy the Worker's `https://…workers.dev` address into Tabula's **Shared Projects** screen.
 
 For local development:
 
