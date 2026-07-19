@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tabula-share",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-19",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COLLABORATION_ROOMS",
+        "class_name": "CollaborationRoom"
+      }
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "SHARED_FILES",
+      "bucket_name": "tabula-shared-files",
+      "preview_bucket_name": "tabula-shared-files-preview"
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CollaborationRoom"]
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
+

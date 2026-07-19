@@ -1,0 +1,20 @@
+{
+  "name": "tabula-cloud-sharing",
+  "private": true,
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "repository": "https://github.com/Edwa0506/tabula-cloud-sharing",
+  "type": "module",
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:dry": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260719.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.103.0"
+  }
+}
