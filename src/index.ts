@@ -2,11 +2,10 @@ import { DurableObject } from "cloudflare:workers";
 
 interface Env {
   COLLABORATION_ROOMS: DurableObjectNamespace<CollaborationRoom>;
-  SHARED_FILES: R2Bucket;
 }
 
 interface RoomMetadata {
-  version: 1;
+  version: 2;
   roomId: string;
   secretHash: string;
   adminHash: string;
@@ -50,6 +49,9 @@ const RATE_WINDOW_MS = 10_000;
 const MAX_MESSAGES_PER_WINDOW = 500;
 const MAX_BYTES_PER_WINDOW = 48 * 1024 * 1024;
 const RECOVERY_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
+const STORAGE_CHUNK_CHARS = 1_000_000;
+const MAX_ROOM_STORAGE_BYTES = 256 * 1024 * 1024;
+const MAX_ROOM_RECORDS = 10_000;
 
 const corsHeaders = {
   "access-control-allow-origin": "*",
@@ -122,7 +124,7 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/healthz") {
-      return json({ ok: true, service: "tabula-share", version: 1 });
+      return json({ ok: true, service: "tabula-share", version: 2 });
     }
     if (request.method === "GET" && LANDING_PATH.test(url.pathname)) return landingPage();
 
@@ -138,6 +140,20 @@ export class CollaborationRoom extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.initializeStorage();
+  }
+
+  private initializeStorage() {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS encrypted_envelopes (
+        kind TEXT NOT NULL CHECK (kind IN ('snapshot', 'update')),
+        sequence INTEGER NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        byte_length INTEGER NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (kind, sequence, chunk_index)
+      )
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -161,7 +177,7 @@ export class CollaborationRoom extends DurableObject<Env> {
     }
 
     if (request.method === "GET") {
-      if (!await this.ctx.storage.get<RoomMetadata>("metadata")) {
+      if (!this.ctx.storage.kv.get<RoomMetadata>("metadata")) {
         return json({ error: "not_found" }, 404);
       }
       const admin = request.headers.get("x-tabula-admin") ?? "";
@@ -182,7 +198,7 @@ export class CollaborationRoom extends DurableObject<Env> {
     if (request.method === "DELETE") {
       if (
         url.searchParams.get("permanent") === "1"
-        && !await this.ctx.storage.get<RoomMetadata>("metadata")
+        && !this.ctx.storage.kv.get<RoomMetadata>("metadata")
       ) return json({ ok: true, deleted: true });
       const admin = request.headers.get("x-tabula-admin") ?? "";
       const metadata = await this.authorizeAdmin(admin);
@@ -193,7 +209,7 @@ export class CollaborationRoom extends DurableObject<Env> {
       }
       const stoppedAt = Date.now();
       const purgeAt = stoppedAt + RECOVERY_PERIOD_MS;
-      await this.ctx.storage.put("metadata", { ...metadata, stoppedAt, purgeAt, updatedAt: stoppedAt });
+      this.ctx.storage.kv.put("metadata", { ...metadata, stoppedAt, purgeAt, updatedAt: stoppedAt });
       await this.ctx.storage.setAlarm(purgeAt);
       for (const socket of this.ctx.getWebSockets()) socket.close(4404, "Sharing was stopped by its owner.");
       return json({ ok: true, stoppedAt, purgeAt });
@@ -204,7 +220,7 @@ export class CollaborationRoom extends DurableObject<Env> {
       const metadata = await this.authorizeAdmin(admin);
       if (!metadata) return json({ error: "forbidden" }, 403);
       const restored = { ...metadata, stoppedAt: undefined, purgeAt: undefined, updatedAt: Date.now() };
-      await this.ctx.storage.put("metadata", restored);
+      this.ctx.storage.kv.put("metadata", restored);
       await this.ctx.storage.deleteAlarm();
       return json({ ok: true });
     }
@@ -251,8 +267,17 @@ export class CollaborationRoom extends DurableObject<Env> {
     }
     const persist = this.persistenceQueue.then(() => this.persist(parsed));
     this.persistenceQueue = persist.then(() => undefined, () => undefined);
-    const stored = await persist;
-    this.broadcast(stored);
+    try {
+      const stored = await persist;
+      this.broadcast(stored);
+    } catch (error) {
+      const quota = error instanceof StorageQuotaError;
+      const message = quota
+        ? error.message
+        : "The encrypted cloud copy could not be saved.";
+      this.send(socket, { type: "error", message });
+      socket.close(quota ? 4429 : 1011, message);
+    }
   }
 
   webSocketClose(): void {
@@ -264,7 +289,7 @@ export class CollaborationRoom extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    const metadata = await this.ctx.storage.get<RoomMetadata>("metadata");
+    const metadata = this.ctx.storage.kv.get<RoomMetadata>("metadata");
     if (metadata?.purgeAt && metadata.purgeAt <= Date.now()) await this.purgeRoom();
   }
 
@@ -301,7 +326,7 @@ export class CollaborationRoom extends DurableObject<Env> {
       return;
     }
 
-    let metadata = await this.ctx.storage.get<RoomMetadata>("metadata");
+    let metadata = this.ctx.storage.kv.get<RoomMetadata>("metadata");
     if (!metadata) {
       if (!create || !this.roomId) {
         this.reject(socket, "This shared project does not exist.");
@@ -309,7 +334,7 @@ export class CollaborationRoom extends DurableObject<Env> {
       }
       const now = Date.now();
       metadata = {
-        version: 1,
+        version: 2,
         roomId: this.roomId,
         secretHash: await digest(secret),
         adminHash: await digest(adminSecret),
@@ -318,7 +343,7 @@ export class CollaborationRoom extends DurableObject<Env> {
         latestSequence: 0,
         snapshotBaseSequence: -1,
       };
-      await this.ctx.storage.put("metadata", metadata);
+      this.ctx.storage.kv.put("metadata", metadata);
     }
     if (metadata.stoppedAt) {
       this.reject(socket, "Sharing has ended for this project.", 4404);
@@ -345,42 +370,58 @@ export class CollaborationRoom extends DurableObject<Env> {
   }
 
   private async persist(envelope: EncryptedEnvelope): Promise<StoredEnvelope> {
-    const metadata = await this.ctx.storage.get<RoomMetadata>("metadata");
-    if (!metadata || metadata.stoppedAt || !this.roomId) throw new Error("Room is unavailable.");
-    const sequence = metadata.latestSequence + 1;
-    const stored: StoredEnvelope = { ...envelope, sequence };
-    const baseSequence = Number.isSafeInteger(envelope.baseSequence) ? envelope.baseSequence! : -1;
+    return this.ctx.storage.transactionSync(() => {
+      const metadata = this.ctx.storage.kv.get<RoomMetadata>("metadata");
+      if (!metadata || metadata.stoppedAt || !this.roomId) throw new Error("Room is unavailable.");
+      const sequence = metadata.latestSequence + 1;
+      const stored: StoredEnvelope = { ...envelope, sequence };
+      const serialized = JSON.stringify(stored);
+      const byteLength = new TextEncoder().encode(serialized).byteLength;
+      const baseSequence = Number.isSafeInteger(envelope.baseSequence) ? envelope.baseSequence! : -1;
+      const current = this.roomStorageStats();
+      const useAsSnapshot = envelope.persistence === "snapshot"
+        && baseSequence >= metadata.snapshotBaseSequence;
+      const replaced = useAsSnapshot ? this.snapshotAndUpdateStats(baseSequence) : { storedBytes: 0, storedObjects: 0 };
+      const projectedBytes = current.storedBytes - replaced.storedBytes + byteLength;
+      const projectedObjects = current.storedObjects - replaced.storedObjects + 1;
+      if (projectedBytes > MAX_ROOM_STORAGE_BYTES || projectedObjects > MAX_ROOM_RECORDS) {
+        throw new StorageQuotaError("This project reached Tabula’s free cloud-storage limit. Stop sharing an older project or delete its cloud copy, then try again.");
+      }
 
-    if (envelope.persistence === "snapshot" && baseSequence >= metadata.snapshotBaseSequence) {
-      await this.env.SHARED_FILES.put(this.snapshotKey(), JSON.stringify(stored));
-      await this.deleteUpdatesThrough(baseSequence);
-      metadata.snapshotBaseSequence = baseSequence;
-      metadata.snapshotSequence = sequence;
-    } else {
-      await this.env.SHARED_FILES.put(this.updateKey(sequence), JSON.stringify(stored));
-    }
-    metadata.latestSequence = sequence;
-    metadata.updatedAt = Date.now();
-    await this.ctx.storage.put("metadata", metadata);
-    return stored;
+      if (useAsSnapshot) {
+        this.ctx.storage.sql.exec("DELETE FROM encrypted_envelopes WHERE kind = 'snapshot'");
+        this.ctx.storage.sql.exec(
+          "DELETE FROM encrypted_envelopes WHERE kind = 'update' AND sequence <= ?",
+          baseSequence,
+        );
+        this.writeRecord("snapshot", sequence, serialized, byteLength);
+        metadata.snapshotBaseSequence = baseSequence;
+        metadata.snapshotSequence = sequence;
+      } else {
+        this.writeRecord("update", sequence, serialized, byteLength);
+      }
+      metadata.latestSequence = sequence;
+      metadata.updatedAt = Date.now();
+      this.ctx.storage.kv.put("metadata", metadata);
+      return stored;
+    });
   }
 
   private async replay(socket: WebSocket, metadata: RoomMetadata) {
-    const snapshot = await this.env.SHARED_FILES.get(this.snapshotKey());
-    if (snapshot) this.send(socket, JSON.parse(await snapshot.text()));
+    const snapshot = this.readRecord("snapshot", metadata.snapshotSequence ?? 0);
+    if (snapshot) this.send(socket, JSON.parse(snapshot));
 
-    const prefix = this.updatePrefix();
-    let cursor: string | undefined;
-    do {
-      const listed = await this.env.SHARED_FILES.list({ prefix, cursor });
-      for (const object of listed.objects.sort((left, right) => left.key.localeCompare(right.key))) {
-        const sequence = Number.parseInt(object.key.slice(prefix.length), 10);
-        if (sequence <= metadata.snapshotBaseSequence) continue;
-        const value = await this.env.SHARED_FILES.get(object.key);
-        if (value) this.send(socket, JSON.parse(await value.text()));
-      }
-      cursor = listed.truncated ? listed.cursor : undefined;
-    } while (cursor);
+    const updates = this.ctx.storage.sql.exec<{ sequence: number }>(
+      `SELECT sequence
+       FROM encrypted_envelopes
+       WHERE kind = 'update' AND chunk_index = 0 AND sequence > ?
+       ORDER BY sequence`,
+      metadata.snapshotBaseSequence,
+    ).toArray();
+    for (const { sequence } of updates) {
+      const value = this.readRecord("update", sequence);
+      if (value) this.send(socket, JSON.parse(value));
+    }
     this.send(socket, {
       type: "replay-complete",
       version: 2,
@@ -411,71 +452,79 @@ export class CollaborationRoom extends DurableObject<Env> {
 
   private async authorizeAdmin(secret: string) {
     if (!TOKEN_PATTERN.test(secret)) return undefined;
-    const metadata = await this.ctx.storage.get<RoomMetadata>("metadata");
+    const metadata = this.ctx.storage.kv.get<RoomMetadata>("metadata");
     if (!metadata || metadata.adminHash !== await digest(secret)) return undefined;
     return metadata;
   }
 
-  private async roomStorageStats() {
-    const prefix = `rooms/${this.roomId}/`;
-    let cursor: string | undefined;
-    let storedBytes = 0;
-    let storedObjects = 0;
-    do {
-      const listed = await this.env.SHARED_FILES.list({ prefix, cursor });
-      storedObjects += listed.objects.length;
-      storedBytes += listed.objects.reduce((total, object) => total + object.size, 0);
-      cursor = listed.truncated ? listed.cursor : undefined;
-    } while (cursor);
-    return { storedBytes, storedObjects };
+  private roomStorageStats() {
+    return this.storageStats(
+      "SELECT COALESCE(SUM(byte_length), 0) AS storedBytes, COALESCE(SUM(CASE WHEN chunk_index = 0 THEN 1 ELSE 0 END), 0) AS storedObjects FROM encrypted_envelopes",
+    );
   }
 
-  private async deleteUpdatesThrough(sequence: number) {
-    if (sequence < 0) return;
-    const prefix = this.updatePrefix();
-    let cursor: string | undefined;
-    do {
-      const listed = await this.env.SHARED_FILES.list({ prefix, cursor });
-      const keys = listed.objects
-        .filter((object) => Number.parseInt(object.key.slice(prefix.length), 10) <= sequence)
-        .map((object) => object.key);
-      if (keys.length > 0) await this.env.SHARED_FILES.delete(keys);
-      cursor = listed.truncated ? listed.cursor : undefined;
-    } while (cursor);
+  private snapshotAndUpdateStats(sequence: number) {
+    return this.storageStats(
+      `SELECT COALESCE(SUM(byte_length), 0) AS storedBytes,
+              COALESCE(SUM(CASE WHEN chunk_index = 0 THEN 1 ELSE 0 END), 0) AS storedObjects
+       FROM encrypted_envelopes
+       WHERE kind = 'snapshot' OR (kind = 'update' AND sequence <= ?)`,
+      sequence,
+    );
   }
 
   private async purgeRoom() {
     if (!this.roomId) {
-      const metadata = await this.ctx.storage.get<RoomMetadata>("metadata");
+      const metadata = this.ctx.storage.kv.get<RoomMetadata>("metadata");
       this.roomId = metadata?.roomId;
-    }
-    if (this.roomId) {
-      const prefix = `rooms/${this.roomId}/`;
-      let cursor: string | undefined;
-      do {
-        const listed = await this.env.SHARED_FILES.list({ prefix, cursor });
-        if (listed.objects.length > 0) {
-          await this.env.SHARED_FILES.delete(listed.objects.map((object) => object.key));
-        }
-        cursor = listed.truncated ? listed.cursor : undefined;
-      } while (cursor);
     }
     for (const socket of this.ctx.getWebSockets()) socket.close(4404, "Shared project deleted.");
     await this.ctx.storage.deleteAll();
+    this.initializeStorage();
   }
 
-  private snapshotKey() {
-    return `rooms/${this.roomId}/snapshot`;
+  private writeRecord(kind: "snapshot" | "update", sequence: number, serialized: string, byteLength: number) {
+    const chunks = [];
+    for (let offset = 0; offset < serialized.length; offset += STORAGE_CHUNK_CHARS) {
+      chunks.push(serialized.slice(offset, offset + STORAGE_CHUNK_CHARS));
+    }
+    for (let index = 0; index < chunks.length; index += 1) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO encrypted_envelopes (kind, sequence, chunk_index, byte_length, data)
+         VALUES (?, ?, ?, ?, ?)`,
+        kind,
+        sequence,
+        index,
+        index === 0 ? byteLength : 0,
+        chunks[index],
+      );
+    }
   }
 
-  private updatePrefix() {
-    return `rooms/${this.roomId}/updates/`;
+  private readRecord(kind: "snapshot" | "update", sequence: number) {
+    const rows = this.ctx.storage.sql.exec<{ data: string }>(
+      `SELECT data FROM encrypted_envelopes
+       WHERE kind = ? AND sequence = ?
+       ORDER BY chunk_index`,
+      kind,
+      sequence,
+    ).toArray();
+    return rows.length > 0 ? rows.map(({ data }) => data).join("") : undefined;
   }
 
-  private updateKey(sequence: number) {
-    return `${this.updatePrefix()}${String(sequence).padStart(16, "0")}`;
+  private storageStats(query: string, ...bindings: number[]) {
+    const row = this.ctx.storage.sql.exec<{ storedBytes: number; storedObjects: number }>(
+      query,
+      ...bindings,
+    ).one();
+    return {
+      storedBytes: Number(row.storedBytes),
+      storedObjects: Number(row.storedObjects),
+    };
   }
 }
+
+class StorageQuotaError extends Error {}
 
 function isEncryptedEnvelope(
   value: Record<string, unknown>,
