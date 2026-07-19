@@ -11,13 +11,6 @@
       }
     ]
   },
-  "r2_buckets": [
-    {
-      "binding": "SHARED_FILES",
-      "bucket_name": "tabula-shared-files",
-      "preview_bucket_name": "tabula-shared-files-preview"
-    }
-  ],
   "migrations": [
     {
       "tag": "v1",
@@ -28,4 +21,3 @@
     "enabled": true
   }
 }
-
